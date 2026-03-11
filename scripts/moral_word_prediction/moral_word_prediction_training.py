@@ -304,14 +304,33 @@ def unfreeze_last_n_transformer_layers(model, n_last: int):
                     p.requires_grad = True
 
 def train_mlm_model(
-    train_dataset, val_dataset,
-    use_vae=False, use_one_hot=False, char2id=None,
-    latent_dim=20, alpha=1.0, beta=0.01, num_epochs=5, batch_size=32,
-    lr_ae=1e-3, lr_bert=2e-5,
-    dropout_rate=0.1, clip_grad_norm=5.0, weight_decay=1e-5, pooling_method = "mean",
-    scheduler_type="cosine", early_stopping_patience=3,
-    train_n_last_layers=0, log_path=None, inject_embedding=True, model_name =  "bert-base-uncased", eval_only=False, 
-    decay = 0.9, sent_pooler = None, moral_weight = 1.0 # moving_avg_window = -1 means we don't use windowed moving average
+    train_dataset, 
+    val_dataset,
+    use_vae=False, 
+    use_one_hot=False, 
+    char2id=None,
+    latent_dim=20, 
+    alpha=1.0, 
+    beta=0.01, 
+    num_epochs=5, 
+    batch_size=32,
+    lr_ae=1e-3, 
+    lr_bert=2e-5,
+    dropout_rate=0.1, 
+    clip_grad_norm=5.0, 
+    weight_decay=1e-5, 
+    pooling_method = "mean",
+    scheduler_type="cosine", 
+    early_stopping_patience=3,
+    train_n_last_layers=0, 
+    log_path=None, 
+    inject_embedding=True, 
+    model_name =  "bert-base-uncased", 
+    eval_only=False, 
+    decay = 0.9, 
+    sent_pooler = None, 
+    moral_weight = 1.0, # moving_avg_window = -1 means we don't use windowed moving average
+    freeze_bert = False
 ):
     # Load pretrained model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -351,13 +370,15 @@ def train_mlm_model(
     # Freeze all params first
     freeze_all_params(bert_lm)
 
-    # Unfreeze the last n transformer layers
-    unfreeze_last_n_transformer_layers(bert_lm, train_n_last_layers)
+    # Unfreeze the last n transformer layers (if not freezing BERT)
+    if not freeze_bert:
+        unfreeze_last_n_transformer_layers(bert_lm, train_n_last_layers)
 
-    # Allow cls/lm_head layer being trained
-    lm_head = get_lm_head(bert_lm)
-    for _, p in lm_head.named_parameters():
-        p.requires_grad = True
+    # Allow cls/lm_head layer being trained (if not freezing BERT)
+    if not freeze_bert:
+        lm_head = get_lm_head(bert_lm)
+        for _, p in lm_head.named_parameters():
+            p.requires_grad = True
 
     ### H-module
     # NOTE: VAE might be added later
@@ -386,18 +407,18 @@ def train_mlm_model(
         character_embedding = None
         embedding_params = []
 
-    optim_groups = [
-        {"params": [p for _, p in bert_lm.named_parameters() if p.requires_grad], "lr": lr_bert},
-    ]
+    optim_groups = []
 
     if inject_embedding:
-        optim_groups.insert(0, {"params": model_H.parameters(), "lr": lr_ae})
+        optim_groups.append({"params": model_H.parameters(), "lr": lr_ae})
         if use_one_hot and embedding_params:
-            optim_groups.insert(1, {"params": embedding_params, "lr": lr_ae})
+            optim_groups.append({"params": embedding_params, "lr": lr_ae})
         if (not use_one_hot) and (pooler is not None):
-            optim_groups.insert(1, {"params": pooler.parameters(), "lr": lr_ae})
+            optim_groups.append({"params": pooler.parameters(), "lr": lr_ae})
 
-    # Optimizer
+    if not freeze_bert:
+        optim_groups.append({"params": [p for _, p in bert_lm.named_parameters() if p.requires_grad], "lr": lr_bert})
+
     optimizer = AdamW(optim_groups, weight_decay=weight_decay)
 
     # Dataloader
@@ -444,7 +465,7 @@ def train_mlm_model(
             mask_indices = batch["mask_indices"].to(device)    # (B, L)
             span_mask = batch["span_mask"].to(device)          # (B, L) float
 
-
+            
             if inject_embedding:
                 # character vec
                 if use_one_hot:
@@ -750,7 +771,7 @@ def evaluate_mlm(model_H, dataset, tokenizer, bert_lm, pooler=None, use_one_hot=
             total += int(span_mask.sum().item())
 
             # ---- SANITY CHECK PRINTING (hard-coded) ----
-            if printed_success < 3 or printed_failure < 3:
+            if printed_success < 3 or printed_failure < 3: # While not enough results printed
                 seen_valid_tokens += valid_targets.numel()
 
                 if seen_valid_tokens >= 0:   # hard-coded "min_seen_before_print"
@@ -979,7 +1000,8 @@ def main(args):
             eval_only=args.eval_only,
             decay = args.decay,
             sent_pooler = args.sent_pooler,
-            moral_weight=args.moral_weight
+            moral_weight=args.moral_weight,
+            freeze_bert=args.freeze_bert
         )
 
     if model_H:
