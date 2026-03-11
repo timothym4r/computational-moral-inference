@@ -453,6 +453,7 @@ def train_mlm_model(
             pooler.train()
 
         total_loss, recon_total, ce_total, kl_total, ort_total = 0, 0, 0, 0, 0
+        total_samples = 0
 
         # ---- Training loop ----
         for batch_idx, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch+1}")):
@@ -464,6 +465,10 @@ def train_mlm_model(
             target_ids = batch["target_ids"].to(device)        # (B, L)
             mask_indices = batch["mask_indices"].to(device)    # (B, L)
             span_mask = batch["span_mask"].to(device)          # (B, L) float
+            
+            # Compute the number of samples in the current batch
+            batch_size = input_ids.size(0)
+            total_samples += batch_size  # Update total sample count
 
             
             if inject_embedding:
@@ -573,16 +578,22 @@ def train_mlm_model(
             optimizer.step()
             if scheduler_type == "cosine": scheduler.step()
 
-            # accumulate
-            total_loss += loss.item()
-            recon_total += recon_loss.item()
-            ce_total += ce_loss.item()
-            kl_total += kl_div.item() if use_vae else 0
-            ort_total += (beta * ortho_loss).item()
+            # Accumulate metrics
+            total_loss += loss.item() * batch_size  # Multiply by batch size to accumulate correctly
+            recon_total += recon_loss.item() * batch_size
+            ce_total += ce_loss.item() * batch_size
+            kl_total += kl_div.item() * batch_size if use_vae else 0
+            ort_total += (beta * ortho_loss).item() * batch_size
+
+        # Normalize metrics by total number of samples
+        total_loss /= total_samples
+        recon_total /= total_samples
+        ce_total /= total_samples
+        kl_total /= total_samples
+        ort_total /= total_samples
 
         # ---- Evaluation after epoch ----
         eval_metrics = evaluate_mlm(model_H, val_dataset, tokenizer, bert_lm, pooler=pooler, use_one_hot=use_one_hot, character_embedding=character_embedding, inject_embedding=inject_embedding)
-
         val_loss = eval_metrics["cross_entropy"]
 
         print(f"Epoch {epoch+1}: TrainTotal={total_loss:.4f}, Recon={recon_total:.4f}, CE={ce_total:.4f}, Ortho={ort_total:.4f}, KL={kl_total:.4f}")
