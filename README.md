@@ -1,6 +1,6 @@
 # Character Moral Inference
 
-## 🧠 Hypothesis
+## Hypothesis
 The moral words uttered by someone are correlated with their moral character.
 
 ## ⚠ Limitations
@@ -54,7 +54,7 @@ The moral words uttered by someone are correlated with their moral character.
 
 ---
 
-## 🗂 File Structure
+## File Structure
 ```plaintext
 |-- data/            # Dialogue data, character metadata, moral word dictionary
 |-- models/          # AE/VAE checkpoints and BERT adapters
