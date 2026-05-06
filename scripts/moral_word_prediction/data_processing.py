@@ -3,6 +3,10 @@ import numpy as np
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
 
+from utils import add_special_tokens_to_tokenizer
+from utils import build_char_cache_dir
+from utils import build_processed_data_paths
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 TYPE_TOKENS = {
@@ -16,9 +20,8 @@ def prefix_by_type(sentence: str, stype: str) -> str:
 
 def ensure_special_tokens(tokenizer, model, special_tokens):
     """Add special tokens to tokenizer + resize model embeddings if needed."""
-    to_add = [t for t in special_tokens if t not in tokenizer.get_vocab()]
-    if len(to_add) > 0:
-        tokenizer.add_special_tokens({"additional_special_tokens": to_add})
+    num_added = add_special_tokens_to_tokenizer(tokenizer, special_tokens)
+    if num_added > 0:
         model.resize_token_embeddings(len(tokenizer))
 
 def safe_mean(x: torch.Tensor, dim=0, out_dim=None):
@@ -74,15 +77,21 @@ def data_preprocess(
     save_fp16=True               # store history embeds as float16 to reduce JSON size
 ):
     os.makedirs(output_dir, exist_ok=True)
-    char_cache_dir = os.path.join(output_dir, f"char_cache_{pooling_method}")
+    char_cache_dir = build_char_cache_dir(
+        output_dir=output_dir,
+        pooling_method=pooling_method,
+        model_name=model_name,
+        add_type_tokens=add_type_tokens
+    )
     os.makedirs(char_cache_dir, exist_ok=True)
-
-    if sentence_mask_type is not None:
-        train_path = os.path.join(output_dir, f"train_data_{pooling_method}_{threshold}_{sentence_mask_type}.json")
-        test_path = os.path.join(output_dir, f"test_data_{pooling_method}_{threshold}_{sentence_mask_type}.json")
-    else:
-        train_path = os.path.join(output_dir, f"train_data_{pooling_method}_{threshold}.json")
-        test_path = os.path.join(output_dir, f"test_data_{pooling_method}_{threshold}.json")
+    train_path, test_path = build_processed_data_paths(
+        output_dir=output_dir,
+        pooling_method=pooling_method,
+        threshold=threshold,
+        sentence_mask_type=sentence_mask_type,
+        model_name=model_name,
+        add_type_tokens=add_type_tokens
+    )
 
     if not reprocess and os.path.exists(train_path):
         print(f"Found existing data in {output_dir}. Use --reprocess to regenerate.")
@@ -248,6 +257,13 @@ def data_preprocess(
     print(f"Saved train/test data at {output_dir} ({len(train_data)} train / {len(test_data)} test).")
 
 def main(args):
+    if not hasattr(args, "add_type_tokens"):
+        args.add_type_tokens = True
+    if not hasattr(args, "store_history_embeddings"):
+        args.store_history_embeddings = False
+    if not hasattr(args, "max_history_per_type"):
+        args.max_history_per_type = None
+
 
     # NOTE: We can hardcode some flags here for moral word prediction
 
@@ -274,9 +290,11 @@ if __name__ == "__main__":
     parser.add_argument("--pooling_method", type=str, default="mean", choices=["mean", "cls"], help="Pooling method")
     parser.add_argument("--reprocess", action="store_true", help="Force reprocessing even if files exist")
     parser.add_argument("--sentence_mask_type", type=str, default=None, help="Type of sentence masking used ('moral_word' or 'all')")
+    parser.add_argument("--add-type-tokens", dest="add_type_tokens", action=argparse.BooleanOptionalAction, default=True,
+                        help="Whether to prefix sentences with [SPK]/[ACT] and use typed caches")
+    parser.add_argument("--max_history_per_type", type=int, default=None, help="Cap cached history length per sentence type")
     args = parser.parse_args()
 
     print("Starting preprocessing for moral word prediction...")
     main(args)
     print("Preprocessing completed.")
-

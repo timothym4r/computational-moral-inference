@@ -541,6 +541,8 @@ import pickle
 import os
 import numpy as np
 import argparse
+import ast
+import sys
 import torch
 import json
 from tqdm import tqdm
@@ -551,6 +553,13 @@ import pandas as pd
 from scipy.stats import spearmanr
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "moral_word_prediction"))
+from models import Autoencoder as MLMAutoencoder
+from models import TwoStreamAttnPool
+from models import TwoStreamMeanPool
+from models import TwoStreamMovingAvgPool
+from utils import build_char_cache_dir
 
 # Load each embedding dictionary
 
@@ -609,18 +618,114 @@ class MoralClassifier(nn.Module):
         return logits
 
 
+def collect_aligned_embedding_rating_pairs(embeddings_data, ratings_data):
+    aligned = []
+    for movie, characters in embeddings_data.items():
+        if movie not in ratings_data:
+            continue
+        for character, latent in characters.items():
+            rating = ratings_data[movie].get(character)
+            if latent is None or rating is None:
+                continue
+            aligned.append((movie, character, np.asarray(latent), np.asarray(rating)))
+    return aligned
+
+
+def parse_training_args_file(training_args_path):
+    parsed = {}
+    with open(training_args_path, "r") as f:
+        for line in f:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            try:
+                parsed[key] = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                parsed[key] = value
+    return parsed
+
+
+def resolve_existing_path(base_dir, maybe_path):
+    candidates = []
+    if os.path.isabs(maybe_path):
+        candidates.append(maybe_path)
+    else:
+        candidates.append(os.path.abspath(maybe_path))
+        candidates.append(os.path.abspath(os.path.join(base_dir, maybe_path)))
+        candidates.append(os.path.abspath(os.path.join(os.path.dirname(base_dir), maybe_path)))
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.abspath(maybe_path)
+
+
+def build_pooler(sent_pooler, hidden_dim=768, decay=0.9):
+    if sent_pooler == "attn":
+        return TwoStreamAttnPool(hidden_dim=hidden_dim)
+    if sent_pooler == "moving_avg":
+        return TwoStreamMovingAvgPool(hidden_dim=hidden_dim, decay=decay)
+    return TwoStreamMeanPool(hidden_dim=hidden_dim)
+
+
+def compute_character_latents_from_char_cache(char_cache_dir, pooler, model_H, device):
+    if not os.path.isdir(char_cache_dir):
+        raise FileNotFoundError(f"Character cache directory not found: {char_cache_dir}")
+
+    character_latents = {}
+    cache_files = sorted(
+        file_name for file_name in os.listdir(char_cache_dir)
+        if file_name.endswith(".pt")
+    )
+
+    for file_name in tqdm(cache_files, desc="Encoding character caches"):
+        cache_key = file_name[:-3]
+        if "__" not in cache_key:
+            continue
+        movie, character = cache_key.split("__", 1)
+        payload = torch.load(os.path.join(char_cache_dir, file_name), map_location="cpu")
+        embeddings = payload["embeddings"].float()
+        stypes = payload["stypes"]
+
+        spoken_idx = [idx for idx, stype in enumerate(stypes) if stype == "spoken"]
+        action_idx = [idx for idx, stype in enumerate(stypes) if stype == "action"]
+
+        spoken_hist = embeddings[spoken_idx] if spoken_idx else torch.zeros(0, embeddings.size(1))
+        action_hist = embeddings[action_idx] if action_idx else torch.zeros(0, embeddings.size(1))
+
+        spoken_hist = spoken_hist.unsqueeze(0).to(device)
+        action_hist = action_hist.unsqueeze(0).to(device)
+
+        spoken_mask = torch.ones(1, spoken_hist.size(1), device=device) if spoken_hist.size(1) > 0 else torch.zeros(1, 0, device=device)
+        action_mask = torch.ones(1, action_hist.size(1), device=device) if action_hist.size(1) > 0 else torch.zeros(1, 0, device=device)
+
+        embed_dim = embeddings.size(1)
+        spoken_mean = spoken_hist.mean(dim=1) if spoken_hist.size(1) > 0 else torch.zeros(1, embed_dim, device=device)
+        action_mean = action_hist.mean(dim=1) if action_hist.size(1) > 0 else torch.zeros(1, embed_dim, device=device)
+
+        with torch.no_grad():
+            char_vec, _, _, _ = pooler(
+                spoken_hist,
+                spoken_mask,
+                action_hist,
+                action_mask,
+                spk_mean=spoken_mean,
+                act_mean=action_mean
+            )
+            _, z = model_H(char_vec)
+
+        character_latents.setdefault(movie, {})[character] = z.squeeze(0).cpu().numpy()
+
+    return character_latents
+
+
 def method_1(embeddings_data, ratings_data):
     latent_list, rating_list = [], []
-    
-
-    for movie in embeddings_data:
-        for character in embeddings_data[movie]:
-            latent = embeddings_data[movie][character]
-            rating = ratings_data[movie][character]
-
-            if latent is not None and rating is not None:
-                latent_list.append(torch.tensor(latent))
-                rating_list.append(torch.tensor(rating))
+    for _, _, latent, rating in collect_aligned_embedding_rating_pairs(embeddings_data, ratings_data):
+        latent_list.append(torch.tensor(latent))
+        rating_list.append(torch.tensor(rating))
 
     latent_matrix = torch.stack(latent_list).numpy()
     rating_matrix = torch.stack(rating_list).numpy()
@@ -644,14 +749,9 @@ def method_1(embeddings_data, ratings_data):
 def method_2(embeddings_data, ratings_data):
     latent_list, rating_list = [], []
 
-    for movie in embeddings_data:
-        for character in embeddings_data[movie]:
-            latent = embeddings_data[movie][character]
-            rating = ratings_data[movie][character]
-
-            if latent is not None and rating is not None:
-                latent_list.append(torch.tensor(latent))
-                rating_list.append(torch.tensor(rating))
+    for _, _, latent, rating in collect_aligned_embedding_rating_pairs(embeddings_data, ratings_data):
+        latent_list.append(torch.tensor(latent))
+        rating_list.append(torch.tensor(rating))
 
     X = torch.stack(latent_list).numpy()
     Y = torch.stack(rating_list).numpy()
@@ -874,13 +974,9 @@ from scipy.stats import spearmanr
 def compute_spearman(embeddings_data, ratings_data):
     latent_list, rating_list = [], []
 
-    for movie in embeddings_data:
-        for character in embeddings_data[movie]:
-            if movie in ratings_data and character in ratings_data[movie]:
-                latent = embeddings_data[movie][character]
-                rating = ratings_data[movie][character]
-                latent_list.append(torch.tensor(latent))
-                rating_list.append(torch.tensor(rating))
+    for _, _, latent, rating in collect_aligned_embedding_rating_pairs(embeddings_data, ratings_data):
+        latent_list.append(torch.tensor(latent))
+        rating_list.append(torch.tensor(rating))
 
     X = torch.stack(latent_list).numpy()
     Y = torch.stack(rating_list).numpy()
@@ -965,50 +1061,89 @@ def load_or_compute_embeddings(embeddings_path, sentence_data_path = None, recom
             except FileNotFoundError:
                 raise FileNotFoundError("Embeddings file not found. Please recompute embeddings or provide the correct path.")
     else:
-        # We need to provide model_name to choose the correct tokenizer and model.
-        # Here embeddings_path is a folder containing the model and tokenizer.
-        # We need to find the model and tokenizer in the embeddings_path.
         target_folder = embeddings_path
-        
-        classifier_path = find_files_with_key_words(target_folder, "classifier")
+        training_args_path = os.path.join(target_folder, "training_args.txt")
+        if os.path.exists(training_args_path):
+            training_args = parse_training_args_file(training_args_path)
+            if training_args.get("use_one_hot", False):
+                raise NotImplementedError("Embedding analysis currently supports the history-pooler pipeline only, not one-hot embeddings.")
 
+            model_name = training_args.get("model_name", model_name)
+            sent_pooler = training_args.get("sent_pooler", "mean")
+            latent_dim = int(training_args.get("latent_dim", 20))
+            decay = float(training_args.get("decay", 0.9))
+            add_type_tokens = bool(training_args.get("add_type_tokens", True))
+            input_dir = resolve_existing_path(target_folder, training_args["input_dir"])
+            char_cache_dir = build_char_cache_dir(
+                output_dir=input_dir,
+                pooling_method=training_args.get("pooling_method", pooling_method),
+                model_name=model_name,
+                add_type_tokens=add_type_tokens
+            )
+
+            ae_path = find_files_with_key_words(target_folder, "model_H")
+            pooler_path = os.path.join(target_folder, "pooler.pth")
+
+            if ae_path is None:
+                raise FileNotFoundError("AutoEncoder model not found in the specified path.")
+            if not os.path.exists(pooler_path):
+                raise FileNotFoundError("Pooler checkpoint not found in the specified path.")
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model_H = MLMAutoencoder(latent_dim=latent_dim)
+            model_H.load_state_dict(torch.load(ae_path, map_location="cpu"))
+            model_H.to(device)
+            model_H.eval()
+
+            pooler = build_pooler(sent_pooler=sent_pooler, hidden_dim=768, decay=decay)
+            pooler.load_state_dict(torch.load(pooler_path, map_location="cpu"))
+            pooler.to(device)
+            pooler.eval()
+
+            latent_embeddings = compute_character_latents_from_char_cache(
+                char_cache_dir=char_cache_dir,
+                pooler=pooler,
+                model_H=model_H,
+                device=device
+            )
+
+            with open(os.path.join(target_folder, "latent_embeddings.pkl"), "wb") as f:
+                pickle.dump(latent_embeddings, f)
+
+            print("Latent embeddings computed from trained MLM history pooler and saved.")
+            return latent_embeddings
+
+        classifier_path = find_files_with_key_words(target_folder, "classifier")
         if classifier_path is None:
             raise FileNotFoundError("Classifier model not found in the specified path.")
 
-        # Define the sentence data
         if sentence_data_path is None:
             raise ValueError("Please provide the path to the sentence data file when recomputing embeddings.")
 
         with open(sentence_data_path, "r") as f:
-            sentence_data = json.load(f) 
+            sentence_data = json.load(f)
 
-        # embeddings contains the BERT-based embeddings.
-        embeddings = recompute_embeddings(classifier_path, sentence_data, pooling_method, model_name = model_name)
+        embeddings = recompute_embeddings(classifier_path, sentence_data, pooling_method, model_name=model_name)
 
-        # Save the embeddings to a file
         with open(os.path.join(target_folder, "embeddings.pkl"), "wb") as f:
             pickle.dump(embeddings, f)
-        
+
         print("Embeddings recomputed and saved.")
 
-        # Load the AutoEncoder model (model_H) from the embeddings_path
         ae_path = find_files_with_key_words(target_folder, "model_H")
-
         if ae_path is None:
             raise FileNotFoundError("AutoEncoder model not found in the specified path.")
-        
+
         model_H = Autoencoder()
         model_H.load_state_dict(torch.load(ae_path, map_location="cpu"))
         model_H.eval()
         model_H.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         latent_embeddings = encode_latent_embeddings(embeddings, model_H)
 
-        # Save the embeddings to a file
         with open(os.path.join(target_folder, "latent_embeddings.pkl"), "wb") as f:
             pickle.dump(latent_embeddings, f)
 
         print("Latent embeddings computed and saved.")
-        
         return latent_embeddings
 
 def run_analysis(embeddings_path, output_dir, rating_data_path, sentence_data_path = None, recompute_embeddings = False, pooling_method = "cls", model_name = "bert-base-uncased", correlation_threshold=0.4):
@@ -1040,17 +1175,11 @@ def run_analysis(embeddings_path, output_dir, rating_data_path, sentence_data_pa
     #     method_2_result.to_csv(os.path.join(os.path.dirname(embeddings_path), "method_2_results.csv"))
     #     save_folder_path = Path(embeddings_path).parent
 
-    X = np.stack([
-        embeddings_data[movie][char]
-        for movie in embeddings_data
-        for char in embeddings_data[movie]
-    ])
-
-    Y = np.stack([
-        rating_data[movie][char]
-        for movie in embeddings_data
-        for char in embeddings_data[movie]
-    ])
+    aligned_pairs = collect_aligned_embedding_rating_pairs(embeddings_data, rating_data)
+    if not aligned_pairs:
+        raise ValueError("No overlapping character embeddings and crowd ratings were found for analysis.")
+    X = np.stack([latent for _, _, latent, _ in aligned_pairs])
+    Y = np.stack([rating for _, _, _, rating in aligned_pairs])
 
     save_folder_path = output_dir
     method_1_result.to_csv(os.path.join(save_folder_path, "method_1_results.csv"))
@@ -1082,7 +1211,13 @@ def run_analysis(embeddings_path, output_dir, rating_data_path, sentence_data_pa
     corr_df.to_csv(os.path.join(save_folder_path, "spearman_correlation_matrix.csv"), index=True)
     pval_df.to_csv(os.path.join(save_folder_path, "spearman_pvalue_matrix.csv"), index=True)
 
-    plot_heatmap_pvals(moral_corr_df, moral_pval_df, trait_dict, title="Spearman correlations between latent dimensions and moral traits")
+    plot_heatmap_pvals(
+        moral_corr_df,
+        moral_pval_df,
+        target_dir=save_folder_path,
+        trait_dict=trait_dict,
+        title="Spearman correlations between latent dimensions and moral traits"
+    )
 
     # REGRESSION ANALYSIS
 

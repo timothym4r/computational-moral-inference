@@ -34,13 +34,15 @@ from models import TwoStreamMeanPool
 import argparse
 
 from utils import normalize_mask_token
+from utils import add_special_tokens_to_tokenizer
+from utils import build_char_cache_dir
+from utils import build_processed_data_paths
 
 random.seed(42)
 
 def ensure_special_tokens(tokenizer, model, special_tokens):
-    to_add = [t for t in special_tokens if t not in tokenizer.get_vocab()]
-    if len(to_add) > 0:
-        tokenizer.add_special_tokens({"additional_special_tokens": to_add})
+    num_added = add_special_tokens_to_tokenizer(tokenizer, special_tokens)
+    if num_added > 0:
         model.resize_token_embeddings(len(tokenizer))
 
 def filter_maskless_entries(data, tokenizer, max_length=512):
@@ -349,13 +351,15 @@ def train_mlm_model(
     sent_pooler = None, 
     moral_weight = 1.0, # moving_avg_window = -1 means we don't use windowed moving average
     freeze_bert = False,
-    injection_signal_type="recon"
+    injection_signal_type="recon",
+    add_type_tokens=True
 ):
     # Load pretrained model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     bert_lm = AutoModelForMaskedLM.from_pretrained(model_name).to("cuda" if torch.cuda.is_available() else "cpu")
 
-    ensure_special_tokens(tokenizer, bert_lm, ["[SPK]", "[ACT]"])
+    if add_type_tokens:
+        ensure_special_tokens(tokenizer, bert_lm, ["[SPK]", "[ACT]"])
 
     if eval_only:
         print(f"Running evaluation-only mode for {model_name} (no fine-tuning)...")
@@ -967,6 +971,9 @@ def main(args):
     python moral_word_prediction_training.py --input_dir data/ --output_dir models/ --use_vae --num_epochs 10
     """
 
+    if not hasattr(args, "add_type_tokens"):
+        args.add_type_tokens = True
+
     model_H_path = os.path.join(args.output_dir, "model_H.pth")
     bert_lm_path = os.path.join(args.output_dir, "bert_lm.pth")
     log_path = os.path.join(args.output_dir, "logs", "mlm_training_log.csv")
@@ -977,6 +984,8 @@ def main(args):
             f.write(f"{arg}: {value}\n")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+    if args.add_type_tokens:
+        add_special_tokens_to_tokenizer(tokenizer, ["[SPK]", "[ACT]"])
     model_H = None
     character_embedding = None
     bert_lm = None
@@ -990,16 +999,32 @@ def main(args):
                 f.write(f"{arg}: {value}\n")
 
         if args.sentence_mask_type is not None:
-            with open(os.path.join(args.input_dir, f"train_data_{args.pooling_method}_{args.threshold}_{args.sentence_mask_type}.json"), "r") as f:
+            train_path, test_path = build_processed_data_paths(
+                output_dir=args.input_dir,
+                pooling_method=args.pooling_method,
+                threshold=args.threshold,
+                sentence_mask_type=args.sentence_mask_type,
+                model_name=args.model_name,
+                add_type_tokens=args.add_type_tokens
+            )
+            with open(train_path, "r") as f:
                 train_data = json.load(f)
 
-            with open(os.path.join(args.input_dir, f"test_data_{args.pooling_method}_{args.threshold}_{args.sentence_mask_type}.json"), "r") as f:
+            with open(test_path, "r") as f:
                 test_data = json.load(f)
         else:
-            with open(os.path.join(args.input_dir, f"train_data_{args.pooling_method}_{args.threshold}.json"), "r") as f:
+            train_path, test_path = build_processed_data_paths(
+                output_dir=args.input_dir,
+                pooling_method=args.pooling_method,
+                threshold=args.threshold,
+                sentence_mask_type=None,
+                model_name=args.model_name,
+                add_type_tokens=args.add_type_tokens
+            )
+            with open(train_path, "r") as f:
                 train_data = json.load(f)
 
-            with open(os.path.join(args.input_dir, f"test_data_{args.pooling_method}_{args.threshold}.json"), "r") as f:
+            with open(test_path, "r") as f:
                 test_data = json.load(f)
 
         # Normalize [MASK] tokens
@@ -1027,7 +1052,12 @@ def main(args):
             with open(os.path.join(args.output_dir, "char2id.json"), "w") as f:
                 json.dump(char2id, f, indent=2)
 
-        char_cache_dir = os.path.join(args.input_dir, f"char_cache_{args.pooling_method}")
+        char_cache_dir = build_char_cache_dir(
+            output_dir=args.input_dir,
+            pooling_method=args.pooling_method,
+            model_name=args.model_name,
+            add_type_tokens=args.add_type_tokens
+        )
 
         train_dataset = MoralDataset(
             train_data,
@@ -1075,7 +1105,8 @@ def main(args):
             sent_pooler = args.sent_pooler,
             moral_weight=args.moral_weight,
             freeze_bert=args.freeze_bert,
-            injection_signal_type=args.injection_signal_type
+            injection_signal_type=args.injection_signal_type,
+            add_type_tokens=args.add_type_tokens
         )
 
     if model_H:
@@ -1131,6 +1162,8 @@ if __name__ == "__main__":
                         help="Sentence pooler type for two-stream pooling")
     parser.add_argument("--injection_signal_type", type=str, default="recon", choices=["recon", "z"],
                         help="Character signal fed into the gated injector")
+    parser.add_argument("--add-type-tokens", dest="add_type_tokens", action=argparse.BooleanOptionalAction, default=True,
+                        help="Whether the processed data / tokenizer use [SPK] and [ACT] tokens")
 
     args = parser.parse_args()
     main(args)
