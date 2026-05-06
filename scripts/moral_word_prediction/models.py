@@ -9,131 +9,6 @@ import torch
 import torch.nn as nn
 import os
 
-# class MoralDataset(Dataset):
-#     def __init__(self, data, tokenizer=None, max_length=512, use_one_hot=False, char2id=None, embed_dim=768):
-#         self.data = data
-#         self.tokenizer = tokenizer or BertTokenizer.from_pretrained("bert-base-uncased")
-#         self.max_length = max_length
-#         self.use_one_hot = use_one_hot
-#         self.char2id = char2id
-#         self.embed_dim = embed_dim
-
-#         if self.use_one_hot and self.char2id is None:
-#             raise ValueError("char2id mapping must be provided when use_one_hot=True")
-
-#     def __len__(self):
-#         return len(self.data)
-
-#     def _to_embed_seq(self, maybe_list):
-#         """
-#         Converts a list (T x D) or tensor to a FloatTensor (T x D).
-#         Allows empty list -> (0 x D).
-#         """
-#         if maybe_list is None:
-#             return torch.zeros(0, self.embed_dim, dtype=torch.float32)
-
-#         if torch.is_tensor(maybe_list):
-#             x = maybe_list
-#         else:
-#             # JSON gives python lists; may be [] or list of lists
-#             if len(maybe_list) == 0:
-#                 return torch.zeros(0, self.embed_dim, dtype=torch.float32)
-#             x = torch.tensor(maybe_list)
-
-#         # ensure float32 and shape (T, D)
-#         x = x.to(dtype=torch.float32)
-#         if x.dim() == 1:
-#             # edge case: a single vector saved as [D] (shouldn’t happen, but be robust)
-#             x = x.unsqueeze(0)
-#         return x
-
-#     def _to_embed_vec(self, maybe_list):
-#         """
-#         Converts a list (D) or tensor to FloatTensor (D).
-#         """
-#         if maybe_list is None:
-#             return torch.zeros(self.embed_dim, dtype=torch.float32)
-#         if torch.is_tensor(maybe_list):
-#             x = maybe_list
-#         else:
-#             x = torch.tensor(maybe_list)
-#         return x.to(dtype=torch.float32)
-
-#     def __getitem__(self, idx):
-#         row = self.data[idx]
-
-#         # 1) tokenize target word into wordpieces
-#         target_toks = self.tokenizer.tokenize(row["target_word"])
-#         if len(target_toks) == 0:
-#             raise ValueError(f"Empty tokenization for target_word={row['target_word']}")
-
-#         # 2) ensure masked_sentence has the right number of [MASK] tokens
-#         masked_sentence = row["masked_sentence"]
-
-#         # how many masks are currently in the sentence?
-#         tmp = self.tokenizer(masked_sentence, return_tensors="pt", truncation=True, max_length=self.max_length)
-#         cur_num_masks = (tmp["input_ids"][0] == self.tokenizer.mask_token_id).sum().item()
-
-#         # Common case in your pipeline: exactly 1 [MAXK] in text, but target has k wordpieces
-#         # Expand that single [MASK] into k masks.
-#         if cur_num_masks == 1 and len(target_toks) > 1:
-#             masked_sentence = masked_sentence.replace(
-#                 self.tokenizer.mask_token,
-#                 " ".join([self.tokenizer.mask_token] * len(target_toks)),
-#                 1  # replace only the first occurrence
-#             )
-
-#         # If you already created multiple masks upstream, that's fine.
-#         # But now we must enforce: number of masks == number of target wordpieces
-#         encoding = self.tokenizer(
-#             masked_sentence,
-#             return_tensors="pt",
-#             padding="max_length",
-#             truncation=True,
-#             max_length=self.max_length
-#         )
-
-#         mask_positions = (encoding["input_ids"] == self.tokenizer.mask_token_id).nonzero(as_tuple=True)
-#         mask_indices = mask_positions[1].tolist()  # list of positions in the sequence
-
-#         if len(mask_indices) == 0:
-#             return {}  # or raise
-
-#         if len(mask_indices) != len(target_toks):
-#             # This indicates your masked_sentence and target_word are not aligned.
-#             # Better to skip than train on wrong supervision.
-#             # You can print for debugging:
-#             # print("Mismatch:", row["target_word"], target_toks, "masks:", len(mask_indices), masked_sentence)
-#             return {}
-
-#         target_ids = self.tokenizer.convert_tokens_to_ids(target_toks)
-#         if any(tid == self.tokenizer.unk_token_id for tid in target_ids):
-#             # weird / bad targets; skip
-#             return {}
-
-#         result = {
-#             "input_ids": encoding["input_ids"].squeeze(0),
-#             "attention_mask": encoding["attention_mask"].squeeze(0),
-
-#             # CHANGED: multi-token targets + multi mask indices
-#             "target_ids": torch.tensor(target_ids, dtype=torch.long),          # (k,)
-#             "mask_indices": torch.tensor(mask_indices, dtype=torch.long),      # (k,)
-
-#             "movie": row["movie"],
-#             "character": row["character"],
-#         }
-
-#         if self.use_one_hot:
-#             key = f"{row['movie']}_{row['character']}"
-#             result["character_id"] = torch.tensor(self.char2id[key], dtype=torch.long)
-#         else:
-#             result["spoken_mean"] = self._to_embed_vec(row.get("spoken_mean"))
-#             result["action_mean"] = self._to_embed_vec(row.get("action_mean"))
-#             result["spoken_history_embeds"] = self._to_embed_seq(row.get("spoken_history_embeds"))
-#             result["action_history_embeds"] = self._to_embed_seq(row.get("action_history_embeds"))
-
-#         return result
-
 class MoralDataset(Dataset):
     def __init__(
         self,
@@ -311,6 +186,36 @@ class Autoencoder(nn.Module):
         z = self.encoder(x)
         recon = self.decoder(z)
         return recon, z
+
+
+class CharacterInjector(nn.Module):
+    def __init__(self, hidden_dim=768, signal_dim=768, dropout=0.1, use_layer_norm=True):
+        super().__init__()
+        self.signal_proj = nn.Sequential(
+            nn.Linear(signal_dim, hidden_dim),
+            nn.Tanh()
+        )
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.out_norm = nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity()
+
+    def forward(self, mask_hidden, char_signal):
+        """
+        mask_hidden: B x L x D hidden states at masked positions
+        char_signal: B x S character signal (e.g. z or recon)
+        """
+        projected_signal = self.signal_proj(char_signal)            # B x D
+        expanded_signal = projected_signal.unsqueeze(1).expand(
+            -1, mask_hidden.size(1), -1
+        )                                                           # B x L x D
+        gate_input = torch.cat([mask_hidden, expanded_signal], dim=-1)
+        gate = torch.sigmoid(self.gate_mlp(gate_input))             # B x L x D
+        injected = self.out_norm(mask_hidden + gate * expanded_signal)
+        return injected, gate, projected_signal
 
 
 class TwoStreamAttnPool(nn.Module):

@@ -27,6 +27,7 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 # Import from local modules
 from models import MoralDataset
 from models import Autoencoder
+from models import CharacterInjector
 from models import TwoStreamAttnPool
 from models import TwoStreamMovingAvgPool
 from models import TwoStreamMeanPool
@@ -266,6 +267,23 @@ def custom_collate_fn(batch):
 
     return out
 
+
+def gather_mask_hidden_states(hidden, mask_indices):
+    safe_indices = mask_indices.clamp(min=0)
+    expanded_indices = safe_indices.unsqueeze(-1).expand(-1, -1, hidden.size(-1))
+    gathered = hidden.gather(1, expanded_indices)
+    valid_mask = (mask_indices >= 0).unsqueeze(-1)
+    return gathered * valid_mask
+
+
+def scatter_mask_hidden_states(hidden, mask_indices, updated_mask_hidden):
+    out = hidden.clone()
+    safe_indices = mask_indices.clamp(min=0)
+    batch_indices = torch.arange(hidden.size(0), device=hidden.device).unsqueeze(1).expand_as(safe_indices)
+    valid_mask = mask_indices >= 0
+    out[batch_indices[valid_mask], safe_indices[valid_mask]] = updated_mask_hidden[valid_mask]
+    return out
+
 def get_lm_head(model):
     if hasattr(model, "cls"):
         return model.cls          # BERT
@@ -330,7 +348,8 @@ def train_mlm_model(
     decay = 0.9, 
     sent_pooler = None, 
     moral_weight = 1.0, # moving_avg_window = -1 means we don't use windowed moving average
-    freeze_bert = False
+    freeze_bert = False,
+    injection_signal_type="recon"
 ):
     # Load pretrained model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -345,16 +364,18 @@ def train_mlm_model(
             dataset=val_dataset,
             tokenizer=tokenizer,
             bert_lm=bert_lm,
+            injector=None,
             use_one_hot=False,
             character_embedding=None,
-            inject_embedding=False
+            inject_embedding=False,
+            injection_signal_type=injection_signal_type
         )
         print(f"[Baseline Eval] CE={eval_metrics['cross_entropy']:.4f}, "
               f"PPL={eval_metrics['perplexity']:.4f}, "
               f"Acc@1={eval_metrics['accuracy@1']:.4f}, "
               f"Acc@5={eval_metrics['accuracy@5']:.4f}, "
               f"Acc@10={eval_metrics['accuracy@10']:.4f}")
-        return None, None, bert_lm, None
+        return None, None, bert_lm, None, None
 
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -397,6 +418,15 @@ def train_mlm_model(
     elif inject_embedding and (not use_one_hot):
         pooler = TwoStreamMeanPool(hidden_dim=768).to(device)
 
+    injector = None
+    if inject_embedding:
+        signal_dim = latent_dim if injection_signal_type == "z" else 768
+        injector = CharacterInjector(
+            hidden_dim=bert_lm.config.hidden_size,
+            signal_dim=signal_dim,
+            dropout=dropout_rate
+        ).to(device)
+
     # Character embeddings if one-hot
     if use_one_hot:
         if char2id is None:
@@ -411,6 +441,8 @@ def train_mlm_model(
 
     if inject_embedding:
         optim_groups.append({"params": model_H.parameters(), "lr": lr_ae})
+        if injector is not None:
+            optim_groups.append({"params": injector.parameters(), "lr": lr_ae})
         if use_one_hot and embedding_params:
             optim_groups.append({"params": embedding_params, "lr": lr_ae})
         if (not use_one_hot) and (pooler is not None):
@@ -451,6 +483,9 @@ def train_mlm_model(
         
         if pooler is not None:
             pooler.train()
+        
+        if injector is not None:
+            injector.train()
 
         total_loss, recon_total, ce_total, kl_total, ort_total = 0, 0, 0, 0, 0
         total_samples = 0
@@ -506,14 +541,10 @@ def train_mlm_model(
                     with torch.no_grad():
                         hidden = encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
-                # injection
-                B, L = mask_indices.shape
-                for i in range(B):
-                    for j in range(L):
-                        mi = int(mask_indices[i, j].item())
-                        if mi < 0:   # padding
-                            continue
-                        hidden[i, mi, :] = hidden[i, mi, :] + recon_vec[i]
+                mask_hidden = gather_mask_hidden_states(hidden, mask_indices)
+                char_signal = z if injection_signal_type == "z" else recon_vec
+                updated_mask_hidden, gate, projected_signal = injector(mask_hidden, char_signal)
+                hidden = scatter_mask_hidden_states(hidden, mask_indices, updated_mask_hidden)
 
                 lm_head = get_lm_head(bert_lm)
                 logits = lm_head(hidden)
@@ -593,7 +624,18 @@ def train_mlm_model(
         ort_total /= total_samples
 
         # ---- Evaluation after epoch ----
-        eval_metrics = evaluate_mlm(model_H, val_dataset, tokenizer, bert_lm, pooler=pooler, use_one_hot=use_one_hot, character_embedding=character_embedding, inject_embedding=inject_embedding)
+        eval_metrics = evaluate_mlm(
+            model_H,
+            val_dataset,
+            tokenizer,
+            bert_lm,
+            pooler=pooler,
+            injector=injector,
+            use_one_hot=use_one_hot,
+            character_embedding=character_embedding,
+            inject_embedding=inject_embedding,
+            injection_signal_type=injection_signal_type
+        )
         val_loss = eval_metrics["cross_entropy"]
 
         print(f"Epoch {epoch+1}: TrainTotal={total_loss:.4f}, Recon={recon_total:.4f}, CE={ce_total:.4f}, Ortho={ort_total:.4f}, KL={kl_total:.4f}")
@@ -642,6 +684,7 @@ def train_mlm_model(
                 "model_H": model_H.state_dict(),
                 "bert_lm": bert_lm.state_dict(),
                 "pooler": pooler.state_dict() if pooler is not None else None,  # NEW
+                "injector": injector.state_dict() if injector is not None else None,
                 "character_embedding": character_embedding.state_dict() if character_embedding else None
             }
         else:
@@ -656,6 +699,8 @@ def train_mlm_model(
             model_H.load_state_dict(best_state["model_H"])
             if pooler is not None and best_state["pooler"] is not None:
                 pooler.load_state_dict(best_state["pooler"])
+            if injector is not None and best_state["injector"] is not None:
+                injector.load_state_dict(best_state["injector"])
 
         if character_embedding and best_state["character_embedding"]:
             character_embedding.load_state_dict(best_state["character_embedding"])
@@ -663,9 +708,21 @@ def train_mlm_model(
         if "bert_lm" in best_state and best_state["bert_lm"]:
             bert_lm.load_state_dict(best_state["bert_lm"])
 
-    return model_H, character_embedding, bert_lm, pooler
+    return model_H, character_embedding, bert_lm, pooler, injector
 
-def evaluate_mlm(model_H, dataset, tokenizer, bert_lm, pooler=None, use_one_hot=False, character_embedding=None, batch_size=16, inject_embedding=True):
+def evaluate_mlm(
+    model_H,
+    dataset,
+    tokenizer,
+    bert_lm,
+    pooler=None,
+    injector=None,
+    use_one_hot=False,
+    character_embedding=None,
+    batch_size=16,
+    inject_embedding=True,
+    injection_signal_type="recon"
+):
     if inject_embedding and model_H is not None:
         model_H.eval()
     if character_embedding:
@@ -677,6 +734,9 @@ def evaluate_mlm(model_H, dataset, tokenizer, bert_lm, pooler=None, use_one_hot=
     if pooler is not None:
         pooler.to(device)
         pooler.eval()
+    if injector is not None:
+        injector.to(device)
+        injector.eval()
 
     # device moves
     if inject_embedding and model_H is not None:
@@ -734,13 +794,10 @@ def evaluate_mlm(model_H, dataset, tokenizer, bert_lm, pooler=None, use_one_hot=
                 recon_vec, z = model_H(char_vec)
                 hidden = encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
-                B, L = mask_indices.shape
-                for i in range(B):
-                    for j in range(L):
-                        mi = int(mask_indices[i, j].item())
-                        if mi < 0:
-                            continue
-                        hidden[i, mi, :] += recon_vec[i]
+                mask_hidden = gather_mask_hidden_states(hidden, mask_indices)
+                char_signal = z if injection_signal_type == "z" else recon_vec
+                updated_mask_hidden, gate, projected_signal = injector(mask_hidden, char_signal)
+                hidden = scatter_mask_hidden_states(hidden, mask_indices, updated_mask_hidden)
 
                 lm_head = get_lm_head(bert_lm)
                 logits = lm_head(hidden)  # (B,T,V)
@@ -920,6 +977,11 @@ def main(args):
             f.write(f"{arg}: {value}\n")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+    model_H = None
+    character_embedding = None
+    bert_lm = None
+    pooler = None
+    injector = None
 
     if args.retrain or not (os.path.exists(model_H_path) and os.path.exists(bert_lm_path)):
         os.makedirs(args.output_dir, exist_ok=True)
@@ -985,7 +1047,7 @@ def main(args):
             max_history_per_type=200
         )
 
-        model_H, character_embedding, bert_lm, pooler = train_mlm_model(
+        model_H, character_embedding, bert_lm, pooler, injector = train_mlm_model(
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             use_vae=args.use_vae,
@@ -1012,7 +1074,8 @@ def main(args):
             decay = args.decay,
             sent_pooler = args.sent_pooler,
             moral_weight=args.moral_weight,
-            freeze_bert=args.freeze_bert
+            freeze_bert=args.freeze_bert,
+            injection_signal_type=args.injection_signal_type
         )
 
     if model_H:
@@ -1025,6 +1088,10 @@ def main(args):
     if pooler:
         pooler_path = os.path.join(args.output_dir, "pooler.pth")
         torch.save(pooler.state_dict(), pooler_path)
+
+    if injector:
+        injector_path = os.path.join(args.output_dir, "injector.pth")
+        torch.save(injector.state_dict(), injector_path)
 
     if character_embedding:
         character_embedding_path = os.path.join(args.output_dir, "character_embedding.pth")
@@ -1062,6 +1129,8 @@ if __name__ == "__main__":
     parser.add_argument("--decay", type=float, default=0.9, help="EMA decay for moving_avg pooler")
     parser.add_argument("--sent_pooler", type=str, default="mean", choices=["mean", "attn", "moving_avg"],
                         help="Sentence pooler type for two-stream pooling")
+    parser.add_argument("--injection_signal_type", type=str, default="recon", choices=["recon", "z"],
+                        help="Character signal fed into the gated injector")
 
     args = parser.parse_args()
     main(args)
