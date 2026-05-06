@@ -1,6 +1,45 @@
 import torch
 import numpy as np
 
+
+def add_special_tokens_to_tokenizer(tokenizer, special_tokens):
+    to_add = [t for t in special_tokens if t not in tokenizer.get_vocab()]
+    if to_add:
+        tokenizer.add_special_tokens({"additional_special_tokens": to_add})
+    return len(to_add)
+
+
+def get_model_slug(model_name):
+    return model_name.replace("/", "__")
+
+
+def get_type_token_suffix(add_type_tokens):
+    return "typed" if add_type_tokens else "untyped"
+
+
+def build_processed_data_stem(pooling_method, threshold, sentence_mask_type=None, model_name="bert-base-uncased", add_type_tokens=True):
+    stem = f"{get_model_slug(model_name)}_{pooling_method}_{threshold}_{get_type_token_suffix(add_type_tokens)}"
+    if sentence_mask_type is not None:
+        stem = f"{stem}_{sentence_mask_type}"
+    return stem
+
+
+def build_processed_data_paths(output_dir, pooling_method, threshold, sentence_mask_type=None, model_name="bert-base-uncased", add_type_tokens=True):
+    stem = build_processed_data_stem(
+        pooling_method=pooling_method,
+        threshold=threshold,
+        sentence_mask_type=sentence_mask_type,
+        model_name=model_name,
+        add_type_tokens=add_type_tokens
+    )
+    train_path = f"{output_dir}/train_data_{stem}.json"
+    test_path = f"{output_dir}/test_data_{stem}.json"
+    return train_path, test_path
+
+
+def build_char_cache_dir(output_dir, pooling_method, model_name="bert-base-uncased", add_type_tokens=True):
+    return f"{output_dir}/char_cache_{get_model_slug(model_name)}_{pooling_method}_{get_type_token_suffix(add_type_tokens)}"
+
 def normalize_mask_token(data, tokenizer):
     """
     Replace [MASK] with the tokenizer's mask token in the masked sentences.
@@ -31,6 +70,5 @@ def exponential_smoothing(data, alpha=0.3):
 
 def moving_average(data, window_size=5):
     pass
-
 
 
