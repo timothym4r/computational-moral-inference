@@ -18,7 +18,7 @@ def get_type_token_suffix(add_type_tokens):
 
 
 def build_processed_data_stem(pooling_method, threshold, sentence_mask_type=None, model_name="bert-base-uncased", add_type_tokens=True):
-    stem = f"{get_model_slug(model_name)}_{pooling_method}_{threshold}_{get_type_token_suffix(add_type_tokens)}"
+    stem = f"{pooling_method}_{threshold}_{get_type_token_suffix(add_type_tokens)}"
     if sentence_mask_type is not None:
         stem = f"{stem}_{sentence_mask_type}"
     return stem
@@ -70,5 +70,4 @@ def exponential_smoothing(data, alpha=0.3):
 
 def moving_average(data, window_size=5):
     pass
-
 
