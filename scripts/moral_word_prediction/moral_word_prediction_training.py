@@ -554,7 +554,9 @@ def train_mlm_model(
                 logits = lm_head(hidden)
 
                 # gather logits for each masked position -> (B, L, V)
-                B, T, V = logits.shape
+                B, L = mask_indices.shape
+                B2, T, V = logits.shape
+                assert B == B2
                 mask_logits = torch.zeros(B, L, V, device=logits.device, dtype=logits.dtype)
 
                 for i in range(B):
@@ -978,6 +980,7 @@ def main(args):
     bert_lm_path = os.path.join(args.output_dir, "bert_lm.pth")
     log_path = os.path.join(args.output_dir, "logs", "mlm_training_log.csv")
     # We document all the arguments used for training in a text file
+    os.makedirs(args.output_dir, exist_ok=True)
     arg_log_txt_file = os.path.join(args.output_dir, f"{args.model_name}_mlm_args.txt")
     with open(arg_log_txt_file, "w") as f:
         for arg, value in vars(args).items():
@@ -993,7 +996,6 @@ def main(args):
     injector = None
 
     if args.retrain or not (os.path.exists(model_H_path) and os.path.exists(bert_lm_path)):
-        os.makedirs(args.output_dir, exist_ok=True)
         with open(os.path.join(args.output_dir, "training_args.txt"), "w") as f:
             for arg, value in vars(args).items():
                 f.write(f"{arg}: {value}\n")
@@ -1158,6 +1160,8 @@ if __name__ == "__main__":
     parser.add_argument("--moving_avg", action="store_true", help="Use moving average smoothing for metrics")
     parser.add_argument("--moving_avg_window", type=int, default=-1, help="Window size for moving average smoothing (-1 means no windowing)")
     parser.add_argument("--decay", type=float, default=0.9, help="EMA decay for moving_avg pooler")
+    parser.add_argument("--moral_weight", type=float, default=1.0, help="Weight for moral sentence history in moving average pooling")
+    parser.add_argument("--freeze_bert", action="store_true", help="Freeze the BERT encoder/LM parameters during training")
     parser.add_argument("--sent_pooler", type=str, default="mean", choices=["mean", "attn", "moving_avg"],
                         help="Sentence pooler type for two-stream pooling")
     parser.add_argument("--injection_signal_type", type=str, default="recon", choices=["recon", "z"],
