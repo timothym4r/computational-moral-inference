@@ -981,7 +981,7 @@ def main(args):
     log_path = os.path.join(args.output_dir, "logs", "mlm_training_log.csv")
     # We document all the arguments used for training in a text file
     os.makedirs(args.output_dir, exist_ok=True)
-    arg_log_txt_file = os.path.join(args.output_dir, f"{args.model_name}_mlm_args.txt")
+    arg_log_txt_file = os.path.join(args.output_dir, "mlm_args.txt")
     with open(arg_log_txt_file, "w") as f:
         for arg, value in vars(args).items():
             f.write(f"{arg}: {value}\n")

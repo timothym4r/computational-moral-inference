@@ -9,10 +9,6 @@ def add_special_tokens_to_tokenizer(tokenizer, special_tokens):
     return len(to_add)
 
 
-def get_model_slug(model_name):
-    return model_name.replace("/", "__")
-
-
 def get_type_token_suffix(add_type_tokens):
     return "typed" if add_type_tokens else "untyped"
 
@@ -38,7 +34,7 @@ def build_processed_data_paths(output_dir, pooling_method, threshold, sentence_m
 
 
 def build_char_cache_dir(output_dir, pooling_method, model_name="bert-base-uncased", add_type_tokens=True):
-    return f"{output_dir}/char_cache_{get_model_slug(model_name)}_{pooling_method}_{get_type_token_suffix(add_type_tokens)}"
+    return f"{output_dir}/char_cache_{pooling_method}_{get_type_token_suffix(add_type_tokens)}"
 
 def normalize_mask_token(data, tokenizer):
     """
@@ -70,4 +66,3 @@ def exponential_smoothing(data, alpha=0.3):
 
 def moving_average(data, window_size=5):
     pass
-
